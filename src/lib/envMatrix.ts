@@ -1,0 +1,197 @@
+import { parseEnv, type EnvPair } from "./envParser.ts";
+
+export interface Environment {
+  id: string;
+  name: string;
+  content: string;
+  isProduction?: boolean;
+}
+
+export type VariableStatus =
+  | "SYNCED"        // Present with valid value
+  | "MISSING"       // Not defined in this environment
+  | "PLACEHOLDER"   // Suspicious placeholder value (e.g. localhost, change_me, todo)
+  | "EMPTY";        // Defined with empty string
+
+export interface MatrixRow {
+  key: string;
+  values: Record<string, string | null>;          // envId -> raw value or null
+  statuses: Record<string, VariableStatus>;       // envId -> status
+  isMissingInProd: boolean;
+  hasPlaceholderInProd: boolean;
+  isPlaceholderAnywhere: boolean;
+  environmentsPresentCount: number;
+}
+
+export interface MatrixReport {
+  rows: MatrixRow[];
+  totalKeys: number;
+  healthScore: number; // 0 - 100
+  criticalIssuesCount: number;
+  placeholderWarningsCount: number;
+  syncedCount: number;
+}
+
+const SUSPICIOUS_PLACEHOLDERS = [
+  "localhost",
+  "127.0.0.1",
+  "change_me",
+  "changeme",
+  "todo",
+  "fixme",
+  "your_key_here",
+  "your-api-key",
+  "replace_me",
+  "test_secret",
+  "fake_key",
+  "xxx",
+  "00000000",
+];
+
+/**
+ * Checks if a value appears to be an unconfigured placeholder.
+ */
+export function isPlaceholder(val: string): boolean {
+  const normalized = val.trim().toLowerCase();
+  if (normalized.length === 0) return true;
+  return SUSPICIOUS_PLACEHOLDERS.some((p) => normalized.includes(p));
+}
+
+/**
+ * Builds a comparative matrix across multiple environments.
+ */
+export function buildEnvMatrix(environments: Environment[]): MatrixReport {
+  const envParsedMap = new Map<string, Map<string, string>>();
+  const allKeysSet = new Set<string>();
+
+  // Parse each environment
+  for (const env of environments) {
+    const parsed = parseEnv(env.content);
+    const pairMap = new Map<string, string>();
+    for (const pair of parsed.pairs) {
+      pairMap.set(pair.key, pair.value);
+      allKeysSet.add(pair.key);
+    }
+    envParsedMap.set(env.id, pairMap);
+  }
+
+  const allKeys = Array.from(allKeysSet).sort();
+  const rows: MatrixRow[] = [];
+
+  let criticalIssuesCount = 0;
+  let placeholderWarningsCount = 0;
+  let syncedCount = 0;
+
+  for (const key of allKeys) {
+    const values: Record<string, string | null> = {};
+    const statuses: Record<string, VariableStatus> = {};
+    let isMissingInProd = false;
+    let hasPlaceholderInProd = false;
+    let isPlaceholderAnywhere = false;
+    let presentCount = 0;
+
+    for (const env of environments) {
+      const pairMap = envParsedMap.get(env.id)!;
+      if (!pairMap.has(key)) {
+        values[env.id] = null;
+        statuses[env.id] = "MISSING";
+        if (env.isProduction) {
+          isMissingInProd = true;
+        }
+      } else {
+        presentCount++;
+        const val = pairMap.get(key)!;
+        values[env.id] = val;
+
+        if (val.trim().length === 0) {
+          statuses[env.id] = "EMPTY";
+        } else if (isPlaceholder(val)) {
+          statuses[env.id] = "PLACEHOLDER";
+          isPlaceholderAnywhere = true;
+          if (env.isProduction) {
+            hasPlaceholderInProd = true;
+          }
+        } else {
+          statuses[env.id] = "SYNCED";
+        }
+      }
+    }
+
+    if (isMissingInProd) {
+      criticalIssuesCount++;
+    } else if (hasPlaceholderInProd) {
+      placeholderWarningsCount++;
+    } else if (presentCount === environments.length && !isPlaceholderAnywhere) {
+      syncedCount++;
+    }
+
+    rows.push({
+      key,
+      values,
+      statuses,
+      isMissingInProd,
+      hasPlaceholderInProd,
+      isPlaceholderAnywhere,
+      environmentsPresentCount: presentCount,
+    });
+  }
+
+  // Calculate Health Score (0 - 100)
+  // Missing in production penalizes heavily (-15 pts each)
+  // Placeholder in production penalizes (-10 pts each)
+  // Overall coverage contributes to score
+  let score = 100;
+  score -= criticalIssuesCount * 15;
+  score -= placeholderWarningsCount * 8;
+  if (allKeys.length > 0) {
+    const coverageRatio = syncedCount / allKeys.length;
+    score = Math.round(score * 0.7 + coverageRatio * 30);
+  }
+  const healthScore = Math.max(0, Math.min(100, score));
+
+  return {
+    rows,
+    totalKeys: allKeys.length,
+    healthScore,
+    criticalIssuesCount,
+    placeholderWarningsCount,
+    syncedCount,
+  };
+}
+
+/**
+ * Extracts all missing keys for a target environment as a clean .env template.
+ */
+export function extractMissingKeysTemplate(
+  environments: Environment[],
+  targetEnvId: string
+): string {
+  const matrix = buildEnvMatrix(environments);
+  const targetEnv = environments.find((e) => e.id === targetEnvId);
+  const targetName = targetEnv ? targetEnv.name : "Environment";
+
+  const missingRows = matrix.rows.filter(
+    (row) => row.statuses[targetEnvId] === "MISSING"
+  );
+
+  if (missingRows.length === 0) {
+    return `# All variables are already defined in ${targetName}!`;
+  }
+
+  let output = `# Missing variables required for ${targetName}\n`;
+  output += `# Generated by EnvAudit at ${new Date().toISOString()}\n\n`;
+
+  for (const row of missingRows) {
+    // Find an example value from another environment if available
+    let sampleVal = "";
+    for (const env of environments) {
+      if (env.id !== targetEnvId && row.values[env.id]) {
+        sampleVal = row.values[env.id]!;
+        break;
+      }
+    }
+    output += `${row.key}="${sampleVal}"\n`;
+  }
+
+  return output;
+}
